@@ -404,21 +404,48 @@ SCHEMAS = {
 }
 
 
-def build_ref_map(xml_source) -> dict[str, str]:
-    """Build map of id -> fmt attribute for reference resolution."""
-    ref_map = {}
+FRAME_REF_MAP_KEY = '__frame_refs__'
+BINARY_REF_MAP_KEY = '__binary_refs__'
+BACKTRACE_REF_MAP_KEY = '__backtrace_refs__'
+
+
+def build_ref_map(xml_source) -> dict:
+    """Build map of id -> fmt attribute for reference resolution.
+
+    Instruments also de-duplicates backtrace frames and binaries with id/ref
+    attributes. Those are stored in nested maps so parse_backtrace can resolve
+    frame refs without changing the fmt ref behavior used by the table parsers.
+    """
+    ref_map = {
+        FRAME_REF_MAP_KEY: {},
+        BINARY_REF_MAP_KEY: {},
+        BACKTRACE_REF_MAP_KEY: {},
+    }
     if hasattr(xml_source, 'seek'):
         xml_source.seek(0)
     for event, elem in ET.iterparse(xml_source, events=['end']):
         if 'id' in elem.attrib and 'fmt' in elem.attrib:
             ref_map[elem.attrib['id']] = elem.attrib['fmt']
-        elem.clear()
+
+        if elem.tag == 'binary' and 'id' in elem.attrib and 'ref' not in elem.attrib:
+            binary_data = binary_data_from_element(elem)
+            if binary_data:
+                ref_map[BINARY_REF_MAP_KEY][elem.attrib['id']] = binary_data
+
+        if elem.tag == 'frame' and 'id' in elem.attrib and 'ref' not in elem.attrib:
+            ref_map[FRAME_REF_MAP_KEY][elem.attrib['id']] = frame_data_from_element(elem, ref_map)
+
+        if elem.tag == 'backtrace' and 'id' in elem.attrib and 'ref' not in elem.attrib:
+            ref_map[BACKTRACE_REF_MAP_KEY][elem.attrib['id']] = backtrace_data_from_element(elem, ref_map)
+
+        if elem.tag == 'row':
+            elem.clear()
     if hasattr(xml_source, 'seek'):
         xml_source.seek(0)
     return ref_map
 
 
-def resolve_fmt(elem, ref_map: dict[str, str]) -> str:
+def resolve_fmt(elem, ref_map: dict) -> str:
     if 'ref' in elem.attrib:
         return ref_map.get(elem.attrib['ref'], '')
     return elem.attrib.get('fmt', elem.text or '')
@@ -590,7 +617,90 @@ def safe_int64(val):
     return val
 
 
-def parse_backtrace(elem, ref_map: dict[str, str], binary_info: dict[str, dict] = None) -> str:
+def binary_data_from_element(binary) -> dict:
+    """Extract exported binary metadata into the JSON frame field shape."""
+    binary_name = binary.attrib.get('name', '')
+    binary_path = binary.attrib.get('path', '')
+    load_addr = binary.attrib.get('load-addr', '')
+
+    return {
+        'binary': binary_name,
+        'path': binary_path,
+        'load_addr': load_addr,
+    }
+
+
+def collect_binary_info(binary_data: dict, binary_info: dict[str, dict] = None) -> None:
+    """Collect binary metadata for symbolication if requested."""
+    if binary_info is None:
+        return
+
+    binary_name = binary_data.get('binary', '')
+    binary_path = binary_data.get('path', '')
+    load_addr = binary_data.get('load_addr', '')
+
+    if binary_name and binary_path and load_addr and binary_name not in binary_info:
+        binary_info[binary_name] = {
+            'path': binary_path,
+            'load_addr': load_addr
+        }
+
+
+def resolve_binary_data(binary, ref_map: dict, binary_info: dict[str, dict] = None) -> dict:
+    """Resolve a frame's binary element, including Instruments binary refs."""
+    if binary is None:
+        return {}
+
+    if 'ref' in binary.attrib:
+        binary_data = ref_map.get(BINARY_REF_MAP_KEY, {}).get(binary.attrib['ref'])
+        if binary_data is not None:
+            resolved = dict(binary_data)
+            collect_binary_info(resolved, binary_info)
+            return resolved
+        return {'binary': ref_map.get(binary.attrib['ref'], '')}
+
+    binary_data = binary_data_from_element(binary)
+    collect_binary_info(binary_data, binary_info)
+    return binary_data
+
+
+def frame_data_from_element(frame, ref_map: dict, binary_info: dict[str, dict] = None) -> dict:
+    """Extract one backtrace frame, resolving its nested binary metadata."""
+    frame_data = {
+        'name': frame.attrib.get('name', ''),
+        'addr': frame.attrib.get('addr', ''),
+    }
+    frame_data.update(resolve_binary_data(frame.find('binary'), ref_map, binary_info))
+    return frame_data
+
+
+def resolve_frame_data(frame, ref_map: dict, binary_info: dict[str, dict] = None) -> dict:
+    """Resolve a frame element, including Instruments frame refs."""
+    frame_refs = ref_map.get(FRAME_REF_MAP_KEY, {})
+
+    if 'ref' in frame.attrib:
+        frame_data = frame_refs.get(frame.attrib['ref'])
+        if frame_data is not None:
+            resolved = dict(frame_data)
+            collect_binary_info(resolved, binary_info)
+            return resolved
+        return {'name': '', 'addr': ''}
+
+    frame_data = frame_data_from_element(frame, ref_map, binary_info)
+    if 'id' in frame.attrib:
+        frame_refs[frame.attrib['id']] = dict(frame_data)
+    return frame_data
+
+
+def backtrace_data_from_element(elem, ref_map: dict, binary_info: dict[str, dict] = None) -> list[dict]:
+    """Resolve a backtrace element into an ordered list of frame data."""
+    return [
+        resolve_frame_data(frame, ref_map, binary_info)
+        for frame in elem.findall('.//frame')
+    ]
+
+
+def parse_backtrace(elem, ref_map: dict, binary_info: dict[str, dict] = None) -> str:
     """Parse backtrace XML to JSON, capturing binary info for later symbolication.
 
     Args:
@@ -599,33 +709,19 @@ def parse_backtrace(elem, ref_map: dict[str, str], binary_info: dict[str, dict] 
         binary_info: Optional dict to populate with binary info for symbolication.
                     Keys are binary names, values are dicts with 'path' and 'load_addr'.
     """
-    frames = []
-    for frame in elem.findall('.//frame'):
-        frame_data = {
-            'name': frame.attrib.get('name', ''),
-            'addr': frame.attrib.get('addr', ''),
-        }
-        binary = frame.find('binary')
-        if binary is not None:
-            if 'ref' in binary.attrib:
-                frame_data['binary'] = ref_map.get(binary.attrib['ref'], '')
-            else:
-                binary_name = binary.attrib.get('name', '')
-                binary_path = binary.attrib.get('path', '')
-                load_addr = binary.attrib.get('load-addr', '')
+    backtrace_refs = ref_map.get(BACKTRACE_REF_MAP_KEY, {})
 
-                frame_data['binary'] = binary_name
-                frame_data['path'] = binary_path
-                frame_data['load_addr'] = load_addr
+    if 'ref' in elem.attrib:
+        frames = [dict(frame) for frame in backtrace_refs.get(elem.attrib['ref'], [])]
+    else:
+        frames = backtrace_data_from_element(elem, ref_map, binary_info)
+        if 'id' in elem.attrib:
+            backtrace_refs[elem.attrib['id']] = [dict(frame) for frame in frames]
 
-                # Collect binary info for symbolication if requested
-                if binary_info is not None and binary_name and binary_path and load_addr:
-                    if binary_name not in binary_info:
-                        binary_info[binary_name] = {
-                            'path': binary_path,
-                            'load_addr': load_addr
-                        }
-        frames.append(frame_data)
+    if binary_info is not None:
+        for frame in frames:
+            collect_binary_info(frame, binary_info)
+
     return json.dumps(frames) if frames else ''
 
 
