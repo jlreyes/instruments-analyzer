@@ -1,10 +1,12 @@
 import importlib.util
 import io
 import json
+import tempfile
 import unittest
 from pathlib import Path
 
 from lxml import etree as ET
+import pyarrow.parquet as pq
 
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / 'scripts' / 'export_to_duckdb.py'
@@ -13,40 +15,17 @@ export_to_duckdb = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(export_to_duckdb)
 
 
-SAMPLE_XML = b'''<?xml version="1.0"?>
-<trace-toc>
-  <run>
-    <data>
-      <table schema="time-profile">
-        <row>
-          <backtrace id="10">
-            <frame id="11" name="App.render()" addr="0x1001">
-              <binary id="12" name="Bridge" load-addr="0x1000" path="/Applications/Bridge.app/Bridge"/>
-            </frame>
-            <frame id="13" name="SwiftUI.update()" addr="0x2001">
-              <binary ref="12"/>
-            </frame>
-          </backtrace>
-        </row>
-        <row>
-          <backtrace id="14">
-            <frame ref="13"/>
-            <frame ref="11"/>
-          </backtrace>
-        </row>
-        <row>
-          <backtrace ref="14"/>
-        </row>
-      </table>
-    </data>
-  </run>
-</trace-toc>
-'''
+FIXTURE_PATH = Path(__file__).resolve().parent / 'fixtures' / 'time_profile_dedup.xml'
 
 
-def parse_sample_backtraces(binary_info=None):
-    ref_map = export_to_duckdb.build_ref_map(io.BytesIO(SAMPLE_XML))
-    root = ET.fromstring(SAMPLE_XML)
+def load_fixture_bytes():
+    return FIXTURE_PATH.read_bytes()
+
+
+def parse_fixture_backtraces(binary_info=None):
+    xml_bytes = load_fixture_bytes()
+    ref_map = export_to_duckdb.build_ref_map(io.BytesIO(xml_bytes))
+    root = ET.fromstring(xml_bytes)
     return [
         json.loads(export_to_duckdb.parse_backtrace(backtrace, ref_map, binary_info))
         for backtrace in root.findall('.//backtrace')
@@ -55,41 +34,53 @@ def parse_sample_backtraces(binary_info=None):
 
 class BacktraceParsingTests(unittest.TestCase):
     def test_parse_backtrace_resolves_frame_refs_across_rows(self):
-        frames = parse_sample_backtraces()[1]
+        frames = parse_fixture_backtraces()[2]
 
-        self.assertEqual(
-            frames,
-            [
-                {
-                    'name': 'SwiftUI.update()',
-                    'addr': '0x2001',
-                    'binary': 'Bridge',
-                    'path': '/Applications/Bridge.app/Bridge',
-                    'load_addr': '0x1000',
-                },
-                {
-                    'name': 'App.render()',
-                    'addr': '0x1001',
-                    'binary': 'Bridge',
-                    'path': '/Applications/Bridge.app/Bridge',
-                    'load_addr': '0x1000',
-                },
-            ],
-        )
+        self.assertEqual(frames[0]['name'], '<deduplicated_symbol>')
+        self.assertEqual(frames[1]['name'], 'stat_with_subsystem')
+        self.assertEqual(frames[-1]['name'], 'start')
+        self.assertEqual(frames[1]['binary'], 'dyld')
+        self.assertEqual(frames[1]['path'], '/usr/lib/dyld')
 
     def test_parse_backtrace_resolves_whole_backtrace_refs(self):
-        parsed = parse_sample_backtraces()
+        parsed = parse_fixture_backtraces()
 
-        self.assertEqual(parsed[2], parsed[1])
-        self.assertEqual([frame['name'] for frame in parsed[2]], ['SwiftUI.update()', 'App.render()'])
+        self.assertEqual(parsed[3], parsed[2])
+        self.assertEqual(parsed[3][1]['name'], 'stat_with_subsystem')
 
     def test_parse_backtrace_populates_binary_info_from_refs(self):
         binary_info = {}
-        parse_sample_backtraces(binary_info)
+        parse_fixture_backtraces(binary_info)
 
         self.assertEqual(
             binary_info,
-            {'Bridge': {'path': '/Applications/Bridge.app/Bridge', 'load_addr': '0x1000'}},
+            {'dyld': {'path': '/usr/lib/dyld', 'load_addr': '0x186781000'}},
+        )
+
+    def test_time_profile_parser_resolves_real_xctrace_fixture(self):
+        xml_stream = io.BytesIO(load_fixture_bytes())
+        ref_map = export_to_duckdb.build_ref_map(xml_stream)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            parquet_path = Path(tmpdir) / 'time_profile.parquet'
+            row_count = export_to_duckdb.parse_time_profile_to_parquet(
+                xml_stream,
+                ref_map,
+                str(parquet_path),
+            )
+            table = pq.read_table(parquet_path, columns=['backtrace_json'])
+
+        backtraces = [
+            json.loads(backtrace_json)
+            for backtrace_json in table.column('backtrace_json').to_pylist()
+        ]
+
+        self.assertEqual(row_count, 4)
+        self.assertEqual(backtraces[3], backtraces[2])
+        self.assertEqual(backtraces[2][1]['name'], 'stat_with_subsystem')
+        self.assertEqual(
+            sum(1 for frames in backtraces for frame in frames if not frame.get('name')),
+            0,
         )
 
     def test_parse_backtrace_still_handles_plain_dicts(self):
