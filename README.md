@@ -75,6 +75,19 @@ duckdb traces/recording/analysis.duckdb
 SELECT * FROM hitches ORDER BY duration_ns DESC LIMIT 10;
 ```
 
+## Tests
+
+The repository includes lightweight unit tests for parser behavior that can run
+without Xcode or an Instruments trace:
+
+```bash
+uv run --with duckdb --with pyarrow --with numpy --with lxml python -m unittest discover -s tests
+```
+
+These tests cover XML parsing edge cases in the exporter, including a captured
+`xcrun xctrace export` time-profile fixture. End-to-end trace export still
+requires macOS with Xcode because it shells out to `xcrun xctrace`.
+
 ## What's included
 
 | File | Description |
