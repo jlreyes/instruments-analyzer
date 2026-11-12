@@ -8,11 +8,27 @@ After exporting trace data with `export_to_duckdb.py`, query using DuckDB SQL or
 - **DuckDB database**: Contains views that reference the Parquet files
 - **Nullable fields**: Most columns support NULL values (except id, start_ns, duration_ns, time_ns)
 
+## Export status
+
+`_export_status` contains one row for each inventoried schema and each known schema absent from the run. The same information is written to `export-status.json` in the per-export Parquet directory, whose path is stored in `metadata` under the key `parquet_dir`.
+
+| Column | Meaning |
+| --- | --- |
+| `schema_name` | Instruments schema identifier |
+| `table_name` | SQL table name; NULL for unknown schemas |
+| `status` | `exported`, `empty`, `not_recorded`, `unsupported`, or `failed` |
+| `row_count` | Number of successfully exported rows |
+| `error` | Failure or unsupported-schema detail, when available |
+
+`empty` means a successful zero-row export; `not_recorded` means the schema was absent from the selected run. `unsupported` means no parser is available; `failed` means export or parsing failed. Failed exports exit nonzero and leave partial data inspectable. Do not interpret an absent view as zero events without checking status. Legacy databases lack this manifest, so the reason for missing data may be unknown.
+
+Frame metrics require frame observations. A trace can declare frame schemas yet contain no frame rows; without frame data, do not claim zero dropped frames, an FPS, or smooth rendering. `prepare_analysis.py` persists `_budget` and `frames` after successful preparation; see [preparation and time windows](SKILL.md#step-4-prepare-derived-views-for-frame-analysis).
+
 ## Tables
 
 ### `updates` — Individual SwiftUI Updates
 
-Every time SwiftUI evaluates a view body, updates a representable, or performs other work.
+Records of SwiftUI body evaluations, representable updates, and other work across modules. To count app body evaluations, filter `module`, `update_type`, `category`, and a stated timestamp window. Stop/flush can emit rows after the advertised recording duration. A half-open filter (`start_ns >= start AND start_ns < end`) selects event starts; an overlap filter selects events differently. Durations may nest or overlap, so their sum is not wall time.
 
 | Column                | Type   | Description                                                              |
 | --------------------- | ------ | ------------------------------------------------------------------------ |
@@ -144,7 +160,7 @@ Time spent waiting for frame presentation.
 
 ### `time_profile` — CPU Profiling Samples
 
-CPU sampling data with backtraces. Each sample represents ~100µs of CPU time.
+CPU sampling data with backtraces. Use the recorded `weight_ns` values rather than assuming a fixed sampling interval. `SUM(weight_ns)/1e6` is sampled CPU weight in milliseconds, not measured elapsed wall time. Scope by timestamp and thread before attributing work.
 
 | Column           | Type   | Description                                           |
 | ---------------- | ------ | ----------------------------------------------------- |
@@ -156,9 +172,13 @@ CPU sampling data with backtraces. Each sample represents ~100µs of CPU time.
 | `weight_ns`      | INT64  | Sample weight (typically 100000 = 100µs)              |
 | `backtrace_json` | STRING | JSON array of stack frames (function names, binaries) |
 
+### `cpu_profile` — CPU Profiler Cycle Samples
+
+CPU Profiler samples use the same columns as `time_profile`, except `weight_cycles` replaces `weight_ns`. `weight_cycles` measures hardware cycles, not nanoseconds; do not convert it to milliseconds or combine it with `time_profile` weights. The exporter keeps these sources separate and creates no compatibility alias.
+
 ### `potential_hangs` — Hang Detection
 
-Detected hangs and unresponsiveness events.
+Potential hang interval records. A count can include overlapping or related intervals and does not necessarily count distinct hang episodes. A NULL `process_name` means the process is unknown; it does not mean the target app was absent.
 
 | Column         | Type   | Description                                                                |
 | -------------- | ------ | -------------------------------------------------------------------------- |

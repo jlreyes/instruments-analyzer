@@ -38,6 +38,10 @@ Progress:
 
 ---
 
+## Check that frame evidence exists
+
+Before following the frame workflow, query `_export_status` (see [the status reference](SCHEMAS.md#export-status)) and run `prepare_analysis.py`. Exit 2 means frame observations are unavailable: report frame metrics as unavailable and continue with any supported CPU, SwiftUI, signpost, or potential-hang findings. Exit 1 means invalid input, incompatible data, or export failure; diagnose the failure. Without frame data, do not claim zero drops, an FPS, or smoothness. Apply the frame inventory, deep-dive, and impact requirements below only when frame observations exist.
+
 ## Step 1: Understand
 
 ### Decide mode
@@ -123,7 +127,7 @@ Use the export script (run it directly, not with `python3`):
 
 The script automatically creates any missing parent directories for the output path.
 
-If key tables are empty, call it out and recommend a different template or longer recording.
+Check `_export_status` before diagnosing a missing table; use the [availability check](#check-that-frame-evidence-exists) before making frame claims.
 
 ---
 
@@ -222,7 +226,10 @@ This creates a `frames` view from `hitches_frame_lifetimes` with computed `misse
 
 - Infers frame budget from `coreanimation_lifetime_intervals.acceptable_latency_ns`
 - Falls back to 60fps (16.67ms) if unavailable
-- Prints summary statistics
+- Persists `_budget` and `frames` for later connections
+- Prints summary statistics only when the selected window has frame observations
+
+Use `--start-s T0 --end-s T1` to select frame starts in `[T0, T1)`: the start is inclusive and the end exclusive. This does not select frames by overlap. Without bounds, preparation includes all stored rows, even stop/flush rows beyond the advertised duration. Each run replaces the previous budget and window; failed or unavailable preparation clears the old derived views.
 
 Override budget for 120fps displays:
 
@@ -258,7 +265,7 @@ ORDER BY frames DESC;
 
 #### Hitch mode (worst-case)
 
-Pick top N by `missed_frames DESC, hitch_ms DESC` inside the interaction window.
+Pick top N by `missed_frames DESC, frame_ms DESC` inside the interaction window.
 
 #### Smoothness mode (median / "not buttery")
 
@@ -270,9 +277,9 @@ Look at:
 
 ### 4.6 Cascade Analysis
 
-A hitch can cause subsequent frames to miss their deadlines (cascade effect). When analyzing a dropped frame, always check the **5 frames before** to find the root cause.
+A hitch can cause subsequent frames to miss their deadlines (a cascade). When analyzing a dropped frame, inspect the **5 preceding frames** on the same display and surface for candidates to investigate.
 
-**Key insight**: If frame N takes too long, frame N+1's work starts late. Even if N+1's work is fast, it may miss its deadline. The damage propagates forward until the system recovers.
+A long frame can delay later work, but preceding-frame duration alone does not establish that this happened in a particular trace.
 
 **Use the script** to analyze a specific frame with cascade context:
 
@@ -285,15 +292,15 @@ This outputs:
 
 - Target frame details
 - 5 preceding frames with budget status
-- Root cause identification (first over-budget frame in sequence)
-- os_signposts during the root cause frame (sorted by duration)
-- os_logs during the root cause frame
+- First over-budget frame as an investigation candidate
+- os_signposts during the candidate frame (sorted by duration)
+- os_logs during the candidate frame; unavailable sources are identified
 
 **Interpretation**:
 
-- If a preceding frame is over budget, the target is a **CASCADE VICTIM** — fix the root cause frame instead
-- If no preceding frame is over budget, the target is the **ROOT CAUSE** — focus analysis there
-- The root cause frame's signposts reveal what work caused the hitch
+- A preceding over-budget frame makes a cascade plausible; temporal adjacency alone does not prove causality.
+- If no preceding frame is over budget, investigate the target; this does not establish it as the root cause.
+- Corroborate candidates with frame phases, signposts, and CPU stacks. Unknown display or surface keys can combine streams. Duplicate swap IDs are rejected; use an explicitly scoped SQL query.
 
 ---
 
@@ -323,8 +330,8 @@ Then:
 
 This gives you:
 
-1. Cascade analysis (is this frame the root cause or a victim?)
-2. Signposts and logs during the actual root cause frame
+1. Temporal context (which preceding frame is a candidate for further investigation?)
+2. Signposts and logs during the candidate frame
 3. Ready-to-paste markdown for your report
 
 Only run manual SQL queries (below) if you need deeper attribution than the script provides.
@@ -342,13 +349,13 @@ SELECT
   swap_id,
   start_ns/1e9 AS time_s,
   frame_ms,
-  hitch_ms,
   missed_frames,
-  severity,
-  type_label
+  bucket,
+  display,
+  surface_id
 FROM frames
 WHERE start_ns BETWEEN {win_start_ns} AND {win_end_ns}
-ORDER BY missed_frames DESC, hitch_ms DESC NULLS LAST, frame_ms DESC
+ORDER BY missed_frames DESC, frame_ms DESC
 LIMIT 25;
 ```
 
@@ -375,15 +382,19 @@ ORDER BY duration_ns DESC
 LIMIT 30;
 ```
 
-Totals:
+Group records by app module, update type, and category. To count body evaluations, select `update_type = 'View Body Updates'` and the desired category; creation and update are distinct. Totals across all types are not body-evaluation counts. Nested or overlapping durations must not be reported as elapsed wall time.
+
+Recorded duration sums (not wall time):
 
 ```sql
 SELECT
-  SUM(duration_ns)/1e6 AS total_swiftui_ms,
-  COUNT(*) AS update_count
+  module, update_type, category,
+  SUM(duration_ns)/1e6 AS recorded_duration_ms,
+  COUNT(*) AS update_records
 FROM updates
 WHERE start_ns < {frame_end_ns}
-  AND (start_ns + duration_ns) > {frame_start_ns};
+  AND (start_ns + duration_ns) > {frame_start_ns}
+GROUP BY module, update_type, category;
 ```
 
 #### B) Transaction/update-group cascades

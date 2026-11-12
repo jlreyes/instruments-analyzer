@@ -404,26 +404,50 @@ SCHEMAS = {
 }
 
 
+# CPU Profiler weights are hardware cycles, unlike Time Profiler nanoseconds.
+SCHEMAS['cpu_profile'] = {
+    'arrow_schema': pa.schema([
+        pa.field('weight_cycles', field.type, nullable=field.nullable)
+        if field.name == 'weight_ns' else field
+        for field in SCHEMAS['time_profile']['arrow_schema']
+    ]),
+    'indexes': ['time_ns'],
+}
+
 FRAME_REF_MAP_KEY = '__frame_refs__'
 BINARY_REF_MAP_KEY = '__binary_refs__'
 BACKTRACE_REF_MAP_KEY = '__backtrace_refs__'
+RAW_REF_MAP_KEY = '__raw_refs__'
+ELEMENT_REF_MAP_KEY = '__element_refs__'
+COLUMNS_KEY = '__columns__'
+BACKTRACE_TAGS = ('backtrace', 'tagged-backtrace')
 
 
 def build_ref_map(xml_source) -> dict:
-    """Build map of id -> fmt attribute for reference resolution.
+    """Index display strings, lossless scalar values, and structured id/ref types.
 
-    Instruments also de-duplicates backtrace frames and binaries with id/ref
-    attributes. Those are stored in nested maps so parse_backtrace can resolve
-    frame refs without changing the fmt ref behavior used by the table parsers.
+    Keep the original flat display map for older parsers; never reconstruct raw
+    nanoseconds or integer identifiers from rounded/localized display strings.
     """
     ref_map = {
         FRAME_REF_MAP_KEY: {},
         BINARY_REF_MAP_KEY: {},
         BACKTRACE_REF_MAP_KEY: {},
+        RAW_REF_MAP_KEY: {},
+        ELEMENT_REF_MAP_KEY: {},
     }
     if hasattr(xml_source, 'seek'):
         xml_source.seek(0)
     for event, elem in ET.iterparse(xml_source, events=['end']):
+        if elem.tag == 'schema':
+            ref_map[COLUMNS_KEY] = [col.findtext('mnemonic') for col in elem.findall('col')]
+            ref_map['__engineering_types__'] = {col.findtext('mnemonic'): col.findtext('engineering-type')
+                                                for col in elem.findall('col')}
+        if 'id' in elem.attrib and 'ref' not in elem.attrib:
+            if elem.text and elem.text.strip():
+                ref_map[RAW_REF_MAP_KEY][elem.attrib['id']] = elem.text.strip()
+            if elem.tag in ('thread', 'process', 'typed-array', 'metadata', 'description-set'):
+                ref_map[ELEMENT_REF_MAP_KEY][elem.attrib['id']] = ET.fromstring(ET.tostring(elem))
         if 'id' in elem.attrib and 'fmt' in elem.attrib:
             ref_map[elem.attrib['id']] = elem.attrib['fmt']
 
@@ -435,10 +459,11 @@ def build_ref_map(xml_source) -> dict:
         if elem.tag == 'frame' and 'id' in elem.attrib and 'ref' not in elem.attrib:
             ref_map[FRAME_REF_MAP_KEY][elem.attrib['id']] = frame_data_from_element(elem, ref_map)
 
-        if elem.tag == 'backtrace' and 'id' in elem.attrib and 'ref' not in elem.attrib:
+        if elem.tag in BACKTRACE_TAGS and 'id' in elem.attrib and 'ref' not in elem.attrib:
             ref_map[BACKTRACE_REF_MAP_KEY][elem.attrib['id']] = backtrace_data_from_element(elem, ref_map)
 
         if elem.tag == 'row':
+            ref_map['__row_count__'] = ref_map.get('__row_count__', 0) + 1
             elem.clear()
     if hasattr(xml_source, 'seek'):
         xml_source.seek(0)
@@ -451,9 +476,67 @@ def resolve_fmt(elem, ref_map: dict) -> str:
     return elem.attrib.get('fmt', elem.text or '')
 
 
+def resolve_raw(elem, ref_map: dict) -> str:
+    """Resolve the lossless exported value, never a rounded display string."""
+    if elem is None:
+        return ''
+    if 'ref' in elem.attrib:
+        return ref_map.get(RAW_REF_MAP_KEY, {}).get(elem.attrib['ref'], '')
+    return (elem.text or '').strip()
+
+
+def resolve_element(elem, ref_map: dict):
+    if elem is not None and 'ref' in elem.attrib:
+        return ref_map.get(ELEMENT_REF_MAP_KEY, {}).get(elem.attrib['ref'], elem)
+    return elem
+
+
+def thread_id(elem, ref_map: dict):
+    elem = resolve_element(elem, ref_map)
+    tid = elem.find('tid') if elem is not None else None
+    return parse_uint32(tid, ref_map) if tid is not None else None
+
+
+def process_name(elem, ref_map: dict):
+    elem = resolve_element(elem, ref_map)
+    if elem is None or elem.tag == 'sentinel':
+        return None
+    name = elem.find('process-name')
+    if name is not None:
+        return resolve_fmt(name, ref_map) or None
+    # The process engineering type exports its name as "name (pid)".
+    display = resolve_fmt(elem, ref_map)
+    pid = elem.find('pid')
+    suffix = f" ({resolve_raw(pid, ref_map)})" if pid is not None else ''
+    return (display[:-len(suffix)] if suffix and display.endswith(suffix) else display) or None
+
+
+def mapped_rows(xml_stream, ref_map: dict, legacy_columns: list[str], required: tuple[str, ...]):
+    """Use schema mnemonics; the no-schema fallback is the original captured layout."""
+    columns = ref_map.get(COLUMNS_KEY, legacy_columns)
+    if len(set(columns)) != len(columns) or any(name not in columns for name in required):
+        raise ValueError(f"Unsupported columns: {columns!r}; required: {required!r}")
+    for _, elem in ET.iterparse(xml_stream, events=['end']):
+        if elem.tag != 'row':
+            continue
+        children = list(elem)
+        if len(children) != len(columns):
+            raise ValueError(f"Row has {len(children)} values for {len(columns)} columns")
+        yield dict(zip(columns, children))
+        elem.clear()
+
+
+def required_ns(elem, ref_map: dict) -> int:
+    raw = resolve_raw(elem, ref_map)
+    if raw.isdigit():
+        return int(raw)
+    raise ValueError(f"Missing or invalid nanosecond value: {ET.tostring(elem)!r}")
+
+
 def parse_duration_ns(elem, ref_map: dict[str, str]) -> int:
-    if elem.text and elem.text.strip().isdigit():
-        return int(elem.text.strip())
+    raw = resolve_raw(elem, ref_map)
+    if raw.isdigit():
+        return int(raw)
     fmt = resolve_fmt(elem, ref_map)
     if not fmt:
         return 0
@@ -476,8 +559,9 @@ def parse_duration_ns(elem, ref_map: dict[str, str]) -> int:
 
 
 def parse_start_ns(elem, ref_map: dict[str, str]) -> int:
-    if elem.text and elem.text.strip().isdigit():
-        return int(elem.text.strip())
+    raw = resolve_raw(elem, ref_map)
+    if raw.isdigit():
+        return int(raw)
     fmt = resolve_fmt(elem, ref_map)
     if fmt and fmt.replace('.', '').isdigit():
         return int(float(fmt) * 1_000_000_000)
@@ -485,15 +569,17 @@ def parse_start_ns(elem, ref_map: dict[str, str]) -> int:
 
 
 def parse_boolean(elem, ref_map: dict[str, str]) -> bool:
-    if elem.text and elem.text.strip().isdigit():
-        return bool(int(elem.text.strip()))
+    raw = resolve_raw(elem, ref_map)
+    if raw.isdigit():
+        return bool(int(raw))
     fmt = resolve_fmt(elem, ref_map)
     return fmt.lower() in ('yes', 'true', '1')
 
 
 def parse_uint32(elem, ref_map: dict[str, str]) -> int:
-    if elem.text and elem.text.strip().isdigit():
-        return int(elem.text.strip())
+    raw = resolve_raw(elem, ref_map)
+    if raw.isdigit():
+        return int(raw)
     fmt = resolve_fmt(elem, ref_map)
     try:
         return int(fmt)
@@ -503,8 +589,9 @@ def parse_uint32(elem, ref_map: dict[str, str]) -> int:
 
 def parse_uint64(elem, ref_map: dict[str, str]) -> int:
     """Parse uint64 values, returns None if exceeds uint64 max."""
-    if elem.text and elem.text.strip().isdigit():
-        val = int(elem.text.strip())
+    raw = resolve_raw(elem, ref_map)
+    if raw.isdigit():
+        val = int(raw)
     else:
         fmt = resolve_fmt(elem, ref_map)
         try:
@@ -522,8 +609,9 @@ def parse_uint64(elem, ref_map: dict[str, str]) -> int:
 
 def parse_uint64_as_string(elem, ref_map: dict[str, str]) -> str:
     """Parse large integers as strings (no data loss, can be cast to HUGEINT in DuckDB)."""
-    if elem.text and elem.text.strip().isdigit():
-        return elem.text.strip()
+    raw = resolve_raw(elem, ref_map)
+    if raw.isdigit():
+        return raw
     fmt = resolve_fmt(elem, ref_map)
     try:
         # Validate it's a number
@@ -536,8 +624,9 @@ def parse_uint64_as_string(elem, ref_map: dict[str, str]) -> str:
 def parse_ns_as_string(elem, ref_map: dict[str, str]) -> str:
     """Parse nanosecond values as strings to handle large timestamps - no int conversion."""
     # Get raw text value directly without int conversion
-    if elem.text and elem.text.strip().isdigit():
-        text_val = elem.text.strip()
+    raw = resolve_raw(elem, ref_map)
+    if raw.isdigit():
+        text_val = raw
         # Sanity check: reject astronomical values (> 1000 years in ns)
         try:
             if len(text_val) > 20:  # Anything > 10^20 ns is ~3170 years, clearly wrong
@@ -694,10 +783,17 @@ def resolve_frame_data(frame, ref_map: dict, binary_info: dict[str, dict] = None
 
 def backtrace_data_from_element(elem, ref_map: dict, binary_info: dict[str, dict] = None) -> list[dict]:
     """Resolve a backtrace element into an ordered list of frame data."""
-    return [
-        resolve_frame_data(frame, ref_map, binary_info)
-        for frame in elem.findall('.//frame')
-    ]
+    frames = []
+    for child in elem:
+        if child.tag == 'frame':
+            frames.append(resolve_frame_data(child, ref_map, binary_info))
+        elif child.tag in BACKTRACE_TAGS:
+            if 'ref' in child.attrib:
+                frames.extend(dict(frame) for frame in
+                              ref_map.get(BACKTRACE_REF_MAP_KEY, {}).get(child.attrib['ref'], []))
+            else:
+                frames.extend(backtrace_data_from_element(child, ref_map, binary_info))
+    return frames
 
 
 def parse_backtrace(elem, ref_map: dict, binary_info: dict[str, dict] = None) -> str:
@@ -851,10 +947,7 @@ def extract_identifier_as_string(elem, ref_map: dict[str, str]) -> str:
     return None
 
 
-def export_schema_to_parquet(schema_name: str, trace_path: str, output_dir: str) -> tuple[str, str, int]:
-    """Export a schema from trace to Parquet file. Returns (table_name, parquet_path, row_count)."""
-    # Map schema names to table names
-    table_map = {
+TABLE_MAP = {
         'swiftui-updates': 'updates',
         'swiftui-update-groups': 'update_groups',
         'swiftui-causes': 'swiftui_causes',
@@ -866,6 +959,7 @@ def export_schema_to_parquet(schema_name: str, trace_path: str, output_dir: str)
         'hitches-frame-lifetimes': 'hitches_frame_lifetimes',
         'hitches-framewait': 'hitches_framewait',
         'time-profile': 'time_profile',
+        'cpu-profile': 'cpu_profile',
         'potential-hangs': 'potential_hangs',
         'runloop-intervals': 'runloop_intervals',
         'runloop-events': 'runloop_events',
@@ -878,8 +972,11 @@ def export_schema_to_parquet(schema_name: str, trace_path: str, output_dir: str)
         'os-signpost-arg': 'os_signpost_arg',
         'os-log': 'os_log',
         'os-log-arg': 'os_log_arg',
-    }
-    table_name = table_map.get(schema_name, schema_name.replace('-', '_'))
+}
+
+def export_schema_to_parquet(schema_name: str, trace_path: str, output_dir: str) -> tuple[str, str, int]:
+    """Export one recorded schema; errors propagate to the per-schema status manifest."""
+    table_name = TABLE_MAP[schema_name]
 
     cmd = [
         'xcrun', 'xctrace', 'export',
@@ -890,14 +987,16 @@ def export_schema_to_parquet(schema_name: str, trace_path: str, output_dir: str)
     print(f"[{schema_name}] Exporting from trace...", file=sys.stderr)
     result = subprocess.run(cmd, capture_output=True, text=False)
 
-    if result.returncode != 0 or len(result.stdout) < 100:
-        print(f"[{schema_name}] Empty or failed", file=sys.stderr)
-        return (table_name, '', 0)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode('utf-8', errors='replace').strip() or
+                           f'xctrace exited {result.returncode}')
 
     print(f"[{schema_name}] Parsing XML ({len(result.stdout) / 1024 / 1024:.1f} MB)...", file=sys.stderr)
 
     xml_stream = io.BytesIO(result.stdout)
     ref_map = build_ref_map(xml_stream)
+    if COLUMNS_KEY not in ref_map:
+        raise ValueError('Export did not contain schema metadata')
 
     parquet_path = os.path.join(output_dir, f"{table_name}.parquet")
     row_count = 0
@@ -919,8 +1018,9 @@ def export_schema_to_parquet(schema_name: str, trace_path: str, output_dir: str)
         row_count = parse_hitch_variant_to_parquet(xml_stream, ref_map, parquet_path, table_name, has_offscreen=True)
     elif schema_name in ('hitches-frame-lifetimes', 'hitches-framewait'):
         row_count = parse_frame_timing_to_parquet(xml_stream, ref_map, parquet_path, table_name)
-    elif schema_name == 'time-profile':
-        row_count = parse_time_profile_to_parquet(xml_stream, ref_map, parquet_path)
+    elif schema_name in ('time-profile', 'cpu-profile'):
+        row_count = parse_time_profile_to_parquet(xml_stream, ref_map, parquet_path,
+                                                  table_name=table_name)
     elif schema_name == 'potential-hangs':
         row_count = parse_potential_hangs_to_parquet(xml_stream, ref_map, parquet_path)
     elif schema_name == 'runloop-intervals':
@@ -946,6 +1046,9 @@ def export_schema_to_parquet(schema_name: str, trace_path: str, output_dir: str)
     elif schema_name == 'os-log-arg':
         row_count = parse_os_log_arg_to_parquet(xml_stream, ref_map, parquet_path)
 
+    source_count = ref_map.get('__row_count__', 0)
+    if row_count != source_count:
+        raise ValueError(f'Parser produced {row_count} rows from {source_count} recorded rows')
     if row_count > 0:
         size_mb = os.path.getsize(parquet_path) / 1024 / 1024
         print(f"[{schema_name}] Wrote {row_count:,} rows ({size_mb:.1f} MB)", file=sys.stderr)
@@ -1019,49 +1122,24 @@ def write_parquet(rows: list, schema: pa.Schema, path: str) -> int:
 
 
 def parse_updates_to_parquet(xml_stream, ref_map: dict, parquet_path: str) -> int:
-    """Parse swiftui-updates XML to Parquet."""
+    legacy = ['start', 'duration', 'id', 'update-type', 'allocations', 'description',
+              'category', 'view-hierarchy', 'module', 'view-name', 'process', 'thread',
+              'root-causes', 'severity', 'cause-graph-node']
     rows = []
-    row_id = 0
-
-    for event, elem in ET.iterparse(xml_stream, events=['end']):
-        if elem.tag != 'row':
-            continue
-
-        children = list(elem)
-        if len(children) < 14:
-            elem.clear()
-            continue
-
-        start_ns = parse_start_ns(children[0], ref_map)
-        duration_ns = parse_duration_ns(children[1], ref_map)
-
-        if duration_ns > 0 or start_ns > 0:
-            row_id += 1
-            allocations = None
-            try:
-                if children[4].text and children[4].text.strip().isdigit():
-                    allocations = int(children[4].text.strip())
-            except (ValueError, IndexError):
-                pass
-
-            rows.append((
-                row_id,
-                start_ns,
-                duration_ns,
-                resolve_fmt(children[9], ref_map) or None,  # view_name
-                resolve_fmt(children[5], ref_map) or None,  # description
-                resolve_fmt(children[3], ref_map) or None,  # update_type
-                resolve_fmt(children[13], ref_map) if len(children) > 13 else None,  # severity
-                resolve_fmt(children[8], ref_map) or None,  # module
-                resolve_fmt(children[6], ref_map) or None,  # category
-                allocations,
-                children[14].attrib.get('id') if len(children) > 14 else None,  # cause_graph_node_id
-                None,  # root_causes
-                resolve_fmt(children[7], ref_map) or None,  # view_hierarchy
-            ))
-
-        elem.clear()
-
+    for row in mapped_rows(xml_stream, ref_map, legacy, tuple(legacy)):
+        node = row['cause-graph-node']
+        node_id = None if node.tag == 'sentinel' else node.get('ref', node.get('id'))
+        rows.append((len(rows) + 1, required_ns(row['start'], ref_map),
+                     required_ns(row['duration'], ref_map),
+                     resolve_fmt(row['view-name'], ref_map) or None,
+                     resolve_fmt(row['description'], ref_map) or None,
+                     resolve_fmt(row['update-type'], ref_map) or None,
+                     resolve_fmt(row['severity'], ref_map) or None,
+                     resolve_fmt(row['module'], ref_map) or None,
+                     resolve_fmt(row['category'], ref_map) or None,
+                     parse_uint32(row['allocations'], ref_map), node_id,
+                     resolve_fmt(row['root-causes'], ref_map) or None,
+                     resolve_fmt(row['view-hierarchy'], ref_map) or None))
     return write_parquet(rows, SCHEMAS['updates']['arrow_schema'], parquet_path)
 
 
@@ -1086,9 +1164,9 @@ def parse_groups_to_parquet(xml_stream, ref_map: dict, parquet_path: str) -> int
             row_id += 1
             backtrace = None
             cause_backtrace = None
-            if children[3].tag == 'backtrace':
+            if children[3].tag in BACKTRACE_TAGS:
                 backtrace = parse_backtrace(children[3], ref_map) or None
-            if len(children) > 4 and children[4].tag == 'backtrace':
+            if len(children) > 4 and children[4].tag in BACKTRACE_TAGS:
                 cause_backtrace = parse_backtrace(children[4], ref_map) or None
 
             rows.append((
@@ -1239,103 +1317,32 @@ def parse_frame_timing_to_parquet(xml_stream, ref_map: dict, parquet_path: str, 
     return write_parquet(rows, SCHEMAS[table_name]['arrow_schema'], parquet_path)
 
 
-def parse_time_profile_to_parquet(xml_stream, ref_map: dict, parquet_path: str) -> int:
-    """Parse time-profile XML to Parquet."""
+def parse_time_profile_to_parquet(xml_stream, ref_map: dict, parquet_path: str, table_name: str = 'time_profile') -> int:
+    legacy = ['time', 'thread', 'process', 'core', 'thread-state', 'weight', 'stack']
+    expected_weight_type = 'cycle-weight' if table_name == 'cpu_profile' else 'weight'
+    actual_type = ref_map.get('__engineering_types__', {}).get('weight', expected_weight_type)
+    if actual_type != expected_weight_type:
+        raise ValueError(f'Unsupported {table_name} weight type: {actual_type}')
     rows = []
-    row_id = 0
-
-    for event, elem in ET.iterparse(xml_stream, events=['end']):
-        if elem.tag != 'row':
-            continue
-
-        children = list(elem)
-        if len(children) < 6:
-            elem.clear()
-            continue
-
-        time_ns = parse_start_ns(children[0], ref_map)
-        if time_ns > 0:
-            row_id += 1
-            thread_tid = None
-            if children[1].tag == 'thread':
-                tid_elem = children[1].find('.//tid')
-                if tid_elem is not None:
-                    thread_tid = parse_uint32(tid_elem, ref_map) or None
-
-            core_id = None
-            if len(children) > 3 and children[3].tag == 'core':
-                core_text = resolve_fmt(children[3], ref_map)
-                if core_text:
-                    parts = core_text.split()
-                    if len(parts) >= 2:
-                        try:
-                            core_id = int(parts[-1])
-                        except ValueError:
-                            pass
-
-            backtrace = None
-            if len(children) > 6 and children[6].tag == 'backtrace':
-                backtrace = parse_backtrace(children[6], ref_map) or None
-
-            weight_ns = parse_duration_ns(children[5], ref_map) if len(children) > 5 else None
-
-            rows.append((
-                row_id,
-                time_ns,
-                thread_tid,
-                core_id,
-                resolve_fmt(children[4], ref_map) if len(children) > 4 else None,  # thread_state
-                weight_ns if weight_ns else None,  # weight_ns
-                backtrace,
-            ))
-
-        elem.clear()
-
-    return write_parquet(rows, SCHEMAS['time_profile']['arrow_schema'], parquet_path)
+    for row in mapped_rows(xml_stream, ref_map, legacy, tuple(legacy)):
+        stack = row['stack']
+        core = resolve_raw(row['core'], ref_map)
+        rows.append((len(rows) + 1, required_ns(row['time'], ref_map),
+                     thread_id(row['thread'], ref_map), int(core) if core.isdigit() else None,
+                     resolve_fmt(row['thread-state'], ref_map) or None,
+                     required_ns(row['weight'], ref_map),
+                     (parse_backtrace(stack, ref_map) or None) if stack.tag in BACKTRACE_TAGS else None))
+    return write_parquet(rows, SCHEMAS[table_name]['arrow_schema'], parquet_path)
 
 
 def parse_potential_hangs_to_parquet(xml_stream, ref_map: dict, parquet_path: str) -> int:
-    """Parse potential-hangs XML to Parquet."""
+    legacy = ['start', 'duration', 'hang-type', 'thread', 'process']
     rows = []
-    row_id = 0
-
-    for event, elem in ET.iterparse(xml_stream, events=['end']):
-        if elem.tag != 'row':
-            continue
-
-        children = list(elem)
-        if len(children) < 4:
-            elem.clear()
-            continue
-
-        start_ns = parse_start_ns(children[0], ref_map)
-        duration_ns = parse_duration_ns(children[1], ref_map)
-
-        if duration_ns > 0 or start_ns > 0:
-            row_id += 1
-            thread_tid = None
-            if children[3].tag == 'thread':
-                tid_elem = children[3].find('.//tid')
-                if tid_elem is not None:
-                    thread_tid = parse_uint32(tid_elem, ref_map) or None
-
-            process_name = None
-            if len(children) > 4 and children[4].tag == 'process':
-                name_elem = children[4].find('.//process-name')
-                if name_elem is not None:
-                    process_name = resolve_fmt(name_elem, ref_map) or None
-
-            rows.append((
-                row_id,
-                start_ns,
-                duration_ns,
-                resolve_fmt(children[2], ref_map) or None,  # hang_type
-                thread_tid,
-                process_name,
-            ))
-
-        elem.clear()
-
+    for row in mapped_rows(xml_stream, ref_map, legacy, tuple(legacy)):
+        rows.append((len(rows) + 1, required_ns(row['start'], ref_map),
+                     required_ns(row['duration'], ref_map),
+                     resolve_fmt(row['hang-type'], ref_map) or None,
+                     thread_id(row['thread'], ref_map), process_name(row['process'], ref_map)))
     return write_parquet(rows, SCHEMAS['potential_hangs']['arrow_schema'], parquet_path)
 
 
@@ -1827,111 +1834,32 @@ def parse_coreanimation_lifetime_to_parquet(xml_stream, ref_map: dict, parquet_p
 
 
 def parse_swiftui_causes_to_parquet(xml_stream, ref_map: dict, parquet_path: str) -> int:
-    """Parse swiftui-causes XML to Parquet."""
+    legacy = ['timestamp', 'source-node-event-id', 'source-node', 'destination-node-event-id',
+              'destination-node', 'label', 'value-type', 'changed-properties']
+    def description(elem):
+        elem = resolve_element(elem, ref_map)
+        first = elem.find('string')
+        return resolve_fmt(first if first is not None else elem, ref_map) or None
     rows = []
-    row_id = 0
-
-    for event, elem in ET.iterparse(xml_stream, events=['end']):
-        if elem.tag != 'row':
-            continue
-
-        children = list(elem)
-        if len(children) < 5:
-            elem.clear()
-            continue
-
-        time_ns = parse_start_ns(children[0], ref_map)
-        if time_ns > 0:
-            row_id += 1
-
-            source_event_id = parse_uint32(children[1], ref_map) if len(children) > 1 else None
-            destination_event_id = parse_uint32(children[3], ref_map) if len(children) > 3 else None
-
-            # Extract source metadata description
-            source_description = None
-            if len(children) > 2 and children[2].tag == 'metadata':
-                source_meta = children[2]
-                first_string = source_meta.find('string')
-                if first_string is not None:
-                    source_description = resolve_fmt(first_string, ref_map) or None
-                else:
-                    source_description = source_meta.attrib.get('fmt', '') or None
-
-            # Extract destination metadata description
-            destination_description = None
-            if len(children) > 4 and children[4].tag == 'metadata':
-                dest_meta = children[4]
-                first_string = dest_meta.find('string')
-                if first_string is not None:
-                    destination_description = resolve_fmt(first_string, ref_map) or None
-                else:
-                    destination_description = dest_meta.attrib.get('fmt', '') or None
-
-            label = resolve_fmt(children[5], ref_map) if len(children) > 5 and children[5].tag != 'sentinel' else None
-            value_type = resolve_fmt(children[6], ref_map) if len(children) > 6 and children[6].tag != 'sentinel' else None
-            changed_properties = resolve_fmt(children[7], ref_map) if len(children) > 7 and children[7].tag != 'sentinel' else None
-
-            rows.append((
-                row_id,
-                time_ns,
-                source_event_id,
-                source_description,
-                destination_event_id,
-                destination_description,
-                label or None,
-                value_type or None,
-                changed_properties or None,
-            ))
-
-        elem.clear()
-
+    for row in mapped_rows(xml_stream, ref_map, legacy, tuple(legacy)):
+        rows.append((len(rows) + 1, required_ns(row['timestamp'], ref_map),
+                     parse_uint32(row['source-node-event-id'], ref_map), description(row['source-node']),
+                     parse_uint32(row['destination-node-event-id'], ref_map), description(row['destination-node']),
+                     resolve_fmt(row['label'], ref_map) or None,
+                     resolve_fmt(row['value-type'], ref_map) or None,
+                     resolve_fmt(row['changed-properties'], ref_map) or None))
     return write_parquet(rows, SCHEMAS['swiftui_causes']['arrow_schema'], parquet_path)
 
 
 def parse_swiftui_changes_to_parquet(xml_stream, ref_map: dict, parquet_path: str) -> int:
-    """Parse swiftui-changes XML to Parquet."""
+    legacy = ['timestamp', 'id', 'description', 'backtrace', 'process', 'thread']
     rows = []
-    row_id = 0
-
-    for event, elem in ET.iterparse(xml_stream, events=['end']):
-        if elem.tag != 'row':
-            continue
-
-        children = list(elem)
-        if len(children) < 3:
-            elem.clear()
-            continue
-
-        time_ns = parse_start_ns(children[0], ref_map)
-        if time_ns > 0:
-            row_id += 1
-
-            # Extract thread TID
-            thread_tid = None
-            if len(children) > 5 and children[5].tag == 'thread':
-                tid_elem = children[5].find('.//tid')
-                if tid_elem is not None:
-                    thread_tid = parse_uint32(tid_elem, ref_map)
-
-            change_id = parse_uint32(children[1], ref_map) if len(children) > 1 else None
-            description = resolve_fmt(children[2], ref_map) if len(children) > 2 else None
-
-            # Parse backtrace if present
-            backtrace_json = None
-            if len(children) > 3 and children[3].tag == 'backtrace':
-                backtrace_json = parse_backtrace(children[3], ref_map) or None
-
-            rows.append((
-                row_id,
-                time_ns,
-                change_id,
-                description or None,
-                backtrace_json,
-                thread_tid,
-            ))
-
-        elem.clear()
-
+    for row in mapped_rows(xml_stream, ref_map, legacy, tuple(legacy)):
+        stack = row['backtrace']
+        rows.append((len(rows) + 1, required_ns(row['timestamp'], ref_map),
+                     parse_uint32(row['id'], ref_map), resolve_fmt(row['description'], ref_map) or None,
+                     (parse_backtrace(stack, ref_map) or None) if stack.tag in BACKTRACE_TAGS else None,
+                     thread_id(row['thread'], ref_map)))
     return write_parquet(rows, SCHEMAS['swiftui_changes']['arrow_schema'], parquet_path)
 
 
@@ -2027,14 +1955,14 @@ def parse_os_signpost_intervals_to_parquet(xml_stream, ref_map: dict, parquet_pa
 
             # Parse start-backtrace (index 13) - usually sentinel
             start_backtrace_json = None
-            if len(children) > 13 and children[13].tag == 'backtrace':
+            if len(children) > 13 and children[13].tag in BACKTRACE_TAGS:
                 start_backtrace_json = parse_backtrace(children[13], ref_map) or None
             elif len(children) > 13 and children[13].tag == 'text-backtrace':
                 start_backtrace_json = resolve_fmt(children[13], ref_map) or None
 
             # Parse end-backtrace (index 14) - usually sentinel
             end_backtrace_json = None
-            if len(children) > 14 and children[14].tag == 'backtrace':
+            if len(children) > 14 and children[14].tag in BACKTRACE_TAGS:
                 end_backtrace_json = parse_backtrace(children[14], ref_map) or None
             elif len(children) > 14 and children[14].tag == 'text-backtrace':
                 end_backtrace_json = resolve_fmt(children[14], ref_map) or None
@@ -2150,7 +2078,7 @@ def parse_os_signpost_to_parquet(xml_stream, ref_map: dict, parquet_path: str) -
             backtrace_json = None
             if len(children) > 8 and children[8].tag == 'text-backtrace':
                 backtrace_json = resolve_fmt(children[8], ref_map) or None
-            elif len(children) > 8 and children[8].tag == 'backtrace':
+            elif len(children) > 8 and children[8].tag in BACKTRACE_TAGS:
                 backtrace_json = parse_backtrace(children[8], ref_map) or None
 
             # Parse subsystem (index 9)
@@ -2322,7 +2250,7 @@ def parse_os_log_to_parquet(xml_stream, ref_map: dict, parquet_path: str) -> int
 
             # Parse backtrace (index 5) - usually sentinel
             backtrace_json = None
-            if len(children) > 5 and children[5].tag == 'backtrace':
+            if len(children) > 5 and children[5].tag in BACKTRACE_TAGS:
                 backtrace_json = parse_backtrace(children[5], ref_map) or None
             elif len(children) > 5 and children[5].tag == 'text-backtrace':
                 backtrace_json = resolve_fmt(children[5], ref_map) or None
@@ -2430,65 +2358,61 @@ def parse_os_log_arg_to_parquet(xml_stream, ref_map: dict, parquet_path: str) ->
     return write_parquet(rows, SCHEMAS['os_log_arg']['arrow_schema'], parquet_path)
 
 
-def export_from_trace(trace_path: str, output_dir: str) -> dict[str, tuple[str, int]]:
-    """Export all performance data from a .trace file to Parquet files."""
-    results = {}  # table_name -> (parquet_path, row_count)
 
-    schema_names = [
-        'swiftui-updates',
-        'swiftui-update-groups',
-        'swiftui-causes',
-        'swiftui-changes',
-        'hitches',
-        'hitches-updates',
-        'hitches-renders',
-        'hitches-gpu',
-        'hitches-frame-lifetimes',
-        'hitches-framewait',
-        'time-profile',
-        'potential-hangs',
-        'runloop-intervals',
-        'runloop-events',
-        'coreanimation-context-interval',
-        'coreanimation-layer-interval',
-        'coreanimation-lifetime-interval',
-        'life-cycle-period',
-        'os-signpost-interval',
-        'os-signpost',
-        'os-signpost-arg',
-        'os-log',
-        'os-log-arg',
-    ]
-
-    print(f"\n{'='*60}", file=sys.stderr)
-    print(f"Exporting {len(schema_names)} schemas to Parquet (parallel)...", file=sys.stderr)
-    print(f"{'='*60}\n", file=sys.stderr)
-
-    max_workers = min(os.cpu_count() or 4, len(schema_names))
-    print(f"Using {max_workers} parallel workers", file=sys.stderr)
-
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(export_schema_to_parquet, schema_name, trace_path, output_dir): schema_name
-            for schema_name in schema_names
-        }
-
-        for future in as_completed(futures):
-            table_name, parquet_path, row_count = future.result()
-            if parquet_path and row_count > 0:
-                results[table_name] = (parquet_path, row_count)
-
+def export_from_trace(trace_path: str, output_dir: str, statuses: list = None) -> dict[str, tuple[str, int]]:
+    """Export run 1, recording absent, empty, unsupported, and failed schemas distinctly."""
+    if statuses is None:
+        statuses = []
+    toc = subprocess.run(['xcrun', 'xctrace', 'export', '--input', trace_path, '--toc'],
+                         capture_output=True)
+    if toc.returncode != 0:
+        raise RuntimeError(toc.stderr.decode('utf-8', errors='replace').strip() or 'TOC export failed')
+    root = ET.fromstring(toc.stdout)
+    run = root.find('./run[@number="1"]')
+    if run is None:
+        raise ValueError('Trace has no run 1')
+    recorded = {table.get('schema') for table in run.findall('./data/table')}
+    if None in recorded:
+        raise ValueError('Trace TOC contains a table without a schema')
+    for name in sorted(set(TABLE_MAP) - recorded):
+        statuses.append((name, TABLE_MAP[name], 'not_recorded', 0, None))
+    for name in sorted(recorded - set(TABLE_MAP)):
+        statuses.append((name, None, 'unsupported', 0, 'No parser for this recorded schema'))
+    names = sorted(recorded & set(TABLE_MAP))
+    results = {}
+    if names:
+        # xctrace exports are memory-heavy; bound parallelism independent of host CPU count.
+        with ProcessPoolExecutor(max_workers=min(4, len(names))) as executor:
+            futures = {executor.submit(export_schema_to_parquet, name, trace_path, output_dir): name
+                       for name in names}
+            for future in as_completed(futures):
+                name = futures[future]
+                try:
+                    table, path, count = future.result()
+                    statuses.append((name, table, 'exported' if count else 'empty', count, None))
+                    if count:
+                        results[table] = (path, count)
+                except Exception as exc:
+                    statuses.append((name, TABLE_MAP[name], 'failed', 0, str(exc)))
+                    print(f'[{name}] Failed: {exc}', file=sys.stderr)
+    statuses.sort(key=lambda row: row[0])
     return results
 
 
-def create_duckdb_views(conn: duckdb.DuckDBPyConnection, parquet_dir: str, tables: dict):
+def create_duckdb_views(conn: duckdb.DuckDBPyConnection, parquet_dir: str, tables: dict, statuses: list = None):
     """Create DuckDB views that reference Parquet files."""
     for table_name, (parquet_path, _) in tables.items():
         # Create view pointing to Parquet file
         conn.execute(f"""
             CREATE OR REPLACE VIEW {table_name} AS
-            SELECT * FROM read_parquet('{parquet_path}')
+            SELECT * FROM read_parquet('{parquet_path.replace(chr(39), chr(39) * 2)}')
         """)
+
+    conn.execute("""CREATE TABLE _export_status (
+        schema_name VARCHAR, table_name VARCHAR, status VARCHAR,
+        row_count BIGINT, error VARCHAR)""")
+    if statuses:
+        conn.executemany('INSERT INTO _export_status VALUES (?, ?, ?, ?, ?)', statuses)
 
     # Create metadata table
     conn.execute("""
@@ -2518,36 +2442,43 @@ def main():
 
     args = parser.parse_args()
 
-    trace_path = Path(args.trace)
-    db_path = Path(args.output)
+    trace_path = Path(args.trace).resolve()
+    db_path = Path(args.output).resolve()
 
     if not trace_path.exists():
         print(f"Error: Trace file not found: {trace_path}", file=sys.stderr)
         sys.exit(1)
 
-    # Create output directory for Parquet files (same name as db, without extension)
-    # Use parents=True to create intermediate directories (e.g., traces/recording/)
-    parquet_dir = db_path.parent / db_path.stem
-    parquet_dir.mkdir(parents=True, exist_ok=True)
-
-    # Remove existing DB
-    if db_path.exists():
-        db_path.unlink()
-
-    print(f"Exporting {trace_path}...", file=sys.stderr)
+    # Each export owns its Parquet directory. A failed/empty re-export cannot expose
+    # stale rows from an older invocation, and existing DB readers keep valid paths.
+    parquet_root = db_path.parent / db_path.stem
+    parquet_root.mkdir(parents=True, exist_ok=True)
+    parquet_dir = Path(tempfile.mkdtemp(prefix='export-', dir=parquet_root))
+    print(f"Exporting {trace_path} (run 1)...", file=sys.stderr)
     print(f"Parquet files: {parquet_dir}/", file=sys.stderr)
-    print(f"DuckDB views:  {db_path}", file=sys.stderr)
-
-    # Export to Parquet
-    tables = export_from_trace(str(trace_path), str(parquet_dir))
-
-    # Create DuckDB with views pointing to Parquet files
-    print(f"\nCreating DuckDB database with views...", file=sys.stderr)
-    conn = duckdb.connect(str(db_path))
-    create_duckdb_views(conn, str(parquet_dir), tables)
-    conn.execute("INSERT INTO metadata VALUES ('trace_file', ?)", (str(trace_path),))
-    conn.execute("INSERT INTO metadata VALUES ('parquet_dir', ?)", (str(parquet_dir),))
-    conn.close()
+    statuses = []
+    try:
+        tables = export_from_trace(str(trace_path), str(parquet_dir), statuses)
+    except Exception as exc:
+        print(f"Export failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+    fields = ('schema_name', 'table_name', 'status', 'row_count', 'error')
+    (parquet_dir / 'export-status.json').write_text(
+        json.dumps([dict(zip(fields, row)) for row in statuses], indent=2) + '\n')
+    # Publish the DB only after views and the manifest are complete.
+    fd, pending = tempfile.mkstemp(prefix=db_path.name + '-', suffix='.duckdb', dir=db_path.parent)
+    os.close(fd)
+    os.unlink(pending)  # DuckDB creates its own database header.
+    try:
+        conn = duckdb.connect(pending)
+        create_duckdb_views(conn, str(parquet_dir), tables, statuses)
+        conn.execute("INSERT INTO metadata VALUES ('trace_file', ?)", (str(trace_path),))
+        conn.execute("INSERT INTO metadata VALUES ('parquet_dir', ?)", (str(parquet_dir),))
+        conn.close()
+        os.replace(pending, db_path)
+    finally:
+        if os.path.exists(pending):
+            os.unlink(pending)
 
     # Summary
     total_rows = sum(count for _, count in tables.values())
@@ -2555,10 +2486,14 @@ def main():
     db_size = db_path.stat().st_size / 1024
 
     print(f"\n{'='*60}", file=sys.stderr)
-    print(f"Export complete!", file=sys.stderr)
+    failed = sum(row[2] == 'failed' for row in statuses)
+    print('Export failed for some schemas' if failed else 'Export complete', file=sys.stderr)
     print(f"{'='*60}", file=sys.stderr)
     print(f"Parquet files: {parquet_dir}/ ({total_size:.1f} MB total)", file=sys.stderr)
     print(f"DuckDB database: {db_path} ({db_size:.1f} KB)", file=sys.stderr)
+    print('Schema status: ' + ', '.join(
+        f"{state}={sum(row[2] == state for row in statuses)}"
+        for state in ('exported', 'empty', 'not_recorded', 'unsupported', 'failed')), file=sys.stderr)
     print(f"\nRows by table:", file=sys.stderr)
     for table, (path, count) in sorted(tables.items()):
         size = os.path.getsize(path) / 1024 / 1024
@@ -2568,6 +2503,12 @@ def main():
     print(f"\nUsage:", file=sys.stderr)
     print(f"  duckdb {db_path}", file=sys.stderr)
     print(f"  > SELECT * FROM updates ORDER BY duration_ns DESC LIMIT 10;", file=sys.stderr)
+
+    if failed:
+        sys.exit(1)
+    if not any(row[2] in ('exported', 'empty') for row in statuses):
+        print('No supported data schemas were recorded', file=sys.stderr)
+        sys.exit(2)
 
 
 if __name__ == '__main__':
