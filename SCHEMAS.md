@@ -10,7 +10,7 @@ After exporting trace data with `export_to_duckdb.py`, query using DuckDB SQL or
 
 ## Export status
 
-`_export_status` contains one row for each inventoried schema and each known schema absent from the run. The same information is written to `export-status.json` beside the database.
+`_export_status` contains one row for each inventoried schema and each known schema absent from the run. The same information is written to `export-status.json` in the per-export Parquet directory, whose path is stored in `metadata` under the key `parquet_dir`.
 
 | Column | Meaning |
 | --- | --- |
